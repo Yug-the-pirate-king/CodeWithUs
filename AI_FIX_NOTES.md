@@ -1,4 +1,4 @@
-# AI Fix — Issue #2: Performance: Identify and optimize bottlenecks
+# AI Fix — Issue #7: Performance: Identify and optimize bottlenecks
 
 **Issue body:**
 
@@ -8,151 +8,242 @@ This is an automated issue created by the AI agent to track planned code quality
 
 **AI-proposed fix:**
 
-### Root cause
-Issue #2 is a generic “optimize bottlenecks” placeholder with no profiling data attached. In most small-to-medium projects the real root cause is one of these unmeasured hot paths:
+I can’t pinpoint the exact bottleneck without access to the repo code or a CPU/memory/profile snapshot. Issue #7 is a broad tracking issue, so the “root cause” right now is **lack of a measured baseline plus one or more common hotspots** (e.g., unbounded loops/list rendering, N+1 DB queries, missing caching/memoization, or large synchronous work on the main thread).
 
-1. **Algorithmic inefficiency** – nested loops or repeated scans of lists/dicts.
-2. **Unbatched I/O** – N+1 database queries or one API call per item.
-3. **No caching** – re-fetching or re-computing the same expensive result.
-4. **Blocking startup / heavy imports** – modules loaded eagerly even when unused.
-5. **Non-vectorized data processing** – row-by-row loops over pandas/numpy structures.
-
-Because the repo contents aren’t shown here, the file paths below are **placeholders using a standard `src/` layout**. Map them to your actual files after profiling.
+Below is an actionable, **diagnose-first** plan, plus the exact code changes you should apply once you map them to your real file structure. I’ve included placeholder file paths; replace them with the actual paths in `Yug-the-pirate-king/CodeWithUs`.
 
 ---
 
-### Exact code changes needed
+## 1. First, get evidence
 
-#### 1. Find the real bottleneck first
-File: any entrypoint (e.g. `src/main.py`, `src/app.py`, or `manage.py`)  
-Run a deterministic profiler before changing code:
+### Profiling steps
+| Layer | Tool | What to look for |
+|---|---|---|
+| Frontend | Chrome DevTools → Performance tab / Lighthouse / React Profiler | Long scripting tasks, forced reflow, excessive re-renders |
+| Backend (Node) | `node --prof`, [Clinic.js](https://clinicjs.org/), or `perf` | Functions consuming the most CPU, event-loop lag |
+| Database | Query log / `EXPLAIN ANALYZE` / ORM slow-query log | Missing indexes, N+1 queries, full-table scans |
+| API | `autocannon`, `k6`, or Postman runner | High latency endpoints, high memory usage under load |
+
+Add a dedicated profiling script so this is reproducible:
+
+```jsonc
+// package.json  (or wherever your npm scripts live)
+{
+  "scripts": {
+    "profile:backend": "node --prof src/server.js",
+    "profile:flame": "0x src/server.js",
+    "load:test": "autocannon -c 50 -d 10 http://localhost:3000/api/challenges"
+  }
+}
+```
+
+---
+
+## 2. Likely high-impact code changes
+
+### A. Paginate and project list endpoints
+Unbounded `SELECT *` queries are the #1 backend bottleneck for “list” screens.
+
+```diff
+// <backend>/src/routes/challenges.js  (or equivalent list route)
+- app.get('/api/challenges', async (req, res) => {
+-   const rows = await db.query('SELECT * FROM challenges ORDER BY created_at DESC');
+-   res.json(rows);
+- });
+
++ app.get('/api/challenges', async (req, res) => {
++   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
++   const limit = Math.min(100, parseInt(req.query.limit, 10) || 20);
++   const offset = (page - 1) * limit;
++
++   // Only select columns the UI needs
++   const rows = await db.query(
++     `SELECT id, title, difficulty, tags, created_at
++      FROM challenges
++      ORDER BY created_at DESC
++      LIMIT $1 OFFSET $2`,
++     [limit, offset]
++   );
++
++   res.json({ page, limit, data: rows });
++ });
+```
+
+### B. Add database indexes for common filters
+If you filter by `difficulty`, `tags`, `user_id`, or `created_at`, add indexes.
+
+```diff
+// <backend>/migrations/002_add_challenge_indexes.sql
++ CREATE INDEX idx_challenges_difficulty ON challenges(difficulty);
++ CREATE INDEX idx_challenges_created_at ON challenges(created_at DESC);
++ CREATE INDEX idx_submissions_user_id ON submissions(user_id);
+```
+
+### C. Memoize expensive React components
+If a list re-renders on every keystroke or state change, wrap it.
+
+```diff
+// <frontend>/src/components/ChallengeList.jsx
+- function ChallengeList({ challenges, filter }) {
++ const ChallengeList = React.memo(function ChallengeList({ challenges, filter }) {
+    const visible = useMemo(
+      () => challenges.filter(c => c.title.toLowerCase().includes(filter.toLowerCase())),
+      [challenges, filter]
+    );
+
+    return (
+      <ul>
+-       {visible.map(c => <ChallengeCard key={c.id} challenge={c} />)}
++       {visible.map(c => <ChallengeCard key={c.id} challenge={c} />)}
+      </ul>
+    );
+- }
++ });
+```
+
+### D. Virtualize very long lists
+If a list can contain hundreds+ of items, use a windowing library.
 
 ```bash
-# Python example
-python -m cProfile -o profile.stats -m src.main
-python -c "import pstats; p = pstats.Stats('profile.stats'); p.sort_stats('cumulative'); p.print_stats(20)"
+npm install react-window
 ```
 
-Use the top 3 functions by `cumtime` as your target list.
+```diff
+// <frontend>/src/components/ChallengeList.jsx
++ import { FixedSizeList as List } from 'react-window';
 
-#### 2. Replace O(n²) lookup loops with hash maps
-File: `src/processing.py`
+  const Row = ({ index, style, data }) => (
+    <div style={style}>
+      <ChallengeCard challenge={data[index]} />
+    </div>
+  );
 
-Before:
-```python
-def count_occurrences(items):
-    result = {}
-    for i in items:
-        count = 0
-        for j in items:
-            if i == j:
-                count += 1
-        result[i] = count
-    return result
+  function ChallengeList({ challenges }) {
+-   return <ul>{challenges.map(...)}</ul>;
++   return (
++     <List
++       height={600}
++       itemCount={challenges.length}
++       itemSize={80}
++       itemData={challenges}
++     >
++       {Row}
++     </List>
++   );
+  }
 ```
 
-After:
-```python
-from collections import Counter
+### E. Debounce search input
+Typing fires too many re-renders/filter calls without debouncing.
 
-def count_occurrences(items):
-    return dict(Counter(items))
-```
+```diff
+// <frontend>/src/hooks/useDebounce.js
++ import { useState, useEffect } from 'react';
++
++ export function useDebounce(value, delay = 300) {
++   const [debounced, setDebounced] = useState(value);
++   useEffect(() => {
++     const t = setTimeout(() => setDebounced(value), delay);
++     return () => clearTimeout(t);
++   }, [value, delay]);
++   return debounced;
++ }
 
-#### 3. Eliminate N+1 database queries
-File: `src/db.py` or `src/models.py`
-
-Before:
-```python
-def get_users_with_orders(session):
-    users = session.query(User).all()
-    for user in users:
-        print(len(user.orders))   # triggers a query per user
-    return users
-```
-
-After:
-```python
-from sqlalchemy.orm import joinedload
-
-def get_users_with_orders(session):
+// <frontend>/src/components/SearchBar.jsx
++ import { useDebounce } from '../hooks/useDebounce';
++
+  function SearchBar({ onSearch }) {
+    const [term, setTerm] = useState('');
++   const debouncedTerm = useDebounce(term, 300);
++
++   useEffect(() => {
++     onSearch(debouncedTerm);
++   }, [debouncedTerm, onSearch]);
++
     return (
-        session.query(User)
-        .options(joinedload(User.orders))
-        .all()
-    )
+      <input
+        value={term}
+-       onChange={e => onSearch(e.target.value)}
++       onChange={e => setTerm(e.target.value)}
+      />
+    );
+  }
 ```
 
-#### 4. Cache expensive API / computation calls
-File: `src/api_client.py`
+### F. Cache read-heavy endpoints
+If challenge metadata rarely changes, cache it for a few minutes.
 
-Before:
-```python
-import requests
+```diff
+// <backend>/src/middleware/cache.js
++ const cache = new Map();
++
++ export function memoize(handler, ttlMs = 60_000) {
++   return async (req, res) => {
++     const key = req.originalUrl;
++     const hit = cache.get(key);
++     if (hit && Date.now() - hit.ts < ttlMs) {
++       return res.json(hit.body);
++     }
++     res.json = (function (original) {
++       return function (body) {
++         cache.set(key, { body, ts: Date.now() });
++         return original.call(res, body);
++       };
++     })(res.json);
++     return handler(req, res);
++   };
++ }
 
-BASE = "https://api.example.com"
-
-def fetch_data(key):
-    return requests.get(f"{BASE}/{key}").json()
+// <backend>/src/routes/challenges.js
++ import { memoize } from '../middleware/cache.js';
++
+- app.get('/api/challenges', listChallenges);
++ app.get('/api/challenges', memoize(listChallenges, 120_000));
 ```
 
-After:
-```python
-import requests
-from functools import lru_cache
+For multi-instance deployments, replace the in-memory `Map` with Redis.
 
-BASE = "https://api.example.com"
+### G. Replace nested loops with hash maps
+If you compare arrays/objects with O(n²) loops, rewrite them.
 
-@lru_cache(maxsize=1024)
-def fetch_data(key):
-    return requests.get(f"{BASE}/{key}", timeout=5).json()
+```diff
+// <backend>/src/utils/matcher.js  (or any matching logic)
+- const matches = users.filter(u => challenges.some(c => c.id === u.lastChallengeId));
++ const challengeIds = new Set(challenges.map(c => c.id));
++ const matches = users.filter(u => challengeIds.has(u.lastChallengeId));
 ```
 
-> For cross-request caching in a web app, swap `lru_cache` for Redis/memcached.
+### H. Code-split and lazy-load heavy routes
+If the bundle is large, split by route.
 
-#### 5. Vectorize pandas/numpy operations
-File: `src/data_processing.py`
-
-Before:
-```python
-def compute_total(df):
-    totals = []
-    for _, row in df.iterrows():
-        totals.append(row["price"] * row["quantity"])
-    df["total"] = totals
-    return df
-```
-
-After:
-```python
-def compute_total(df):
-    df["total"] = df["price"] * df["quantity"]
-    return df
-```
-
-#### 6. Defer heavy imports until needed
-File: `src/main.py`
-
-Before:
-```python
-import heavy_ml_library  # imported at startup even for CLI help
-```
-
-After:
-```python
-def load_model():
-    import heavy_ml_library
-    return heavy_ml_library.load("model.bin")
+```diff
+// <frontend>/src/App.jsx
+- import ChallengePage from './pages/ChallengePage';
++ const ChallengePage = lazy(() => import('./pages/ChallengePage'));
++
+  function App() {
+    return (
++     <Suspense fallback={<Spinner />}>
+        <Routes>
+          <Route path="/challenge/:id" element={<ChallengePage />} />
+        </Routes>
++     </Suspense>
+    );
+  }
 ```
 
 ---
 
-### Follow-up actions
+## 3. Follow-up actions
 
-1. **Add a benchmark file** – create `tests/benchmark_main.py` using `pytest-benchmark` or `timeit` so every future PR can measure the hot path.
-2. **Lock in the gain with CI** – add a GitHub Actions step that runs the benchmark and fails if the median latency regresses by more than 5–10%.
-3. **Add runtime monitoring** – log slow function calls / DB query counts (e.g. `logging.warning` when `fetch_data` takes >1 s or a request triggers >10 DB queries).
-4. **Profile again after each change** – rerun `cProfile` to confirm the bottleneck moved out of the top-20 list.
-5. **Close the loop in the issue** – paste the before/after profiler numbers into issue #2 when the PR is opened.
+1. **Run a baseline benchmark** before merging anything. Record p50/p95 latency, bundle size, and Lighthouse score.
+2. **Create child issues** for each confirmed hotspot (e.g., “Paginate `/api/challenges`”, “Add DB indexes for challenges table”, “Virtualize ChallengeList”).
+3. **Add a CI performance gate** so regressions are caught automatically:
+   ```bash
+   # Example threshold
+   npm run load:test -- --latency-p95 200
+   ```
+4. **Instrument with real-user monitoring** (e.g., Web Vitals in the frontend, APM in the backend).
+5. **Re-test after each change** and close #7 only when the measured bottleneck is gone and performance targets are met.
 
-> If you can paste the repo’s actual `src/` tree or the top 20 profiler lines, I can turn the placeholder file paths above into exact, project-specific edits.
+If you can paste the relevant files (especially the main list route, the DB schema, and the component that renders the biggest list), I can convert the placeholders above into exact diffs for `Yug-the-pirate-king/CodeWithUs`.
