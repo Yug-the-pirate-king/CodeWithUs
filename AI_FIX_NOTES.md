@@ -54,9 +54,28 @@ def count_occurrences(items):
 After:
 ```python
 from collections import Counter
+from typing import Iterable, Hashable, Dict
 
-def count_occurrences(items):
-    return dict(Counter(items))
+def count_occurrences(items: Iterable[Hashable]) -> Dict[Hashable, int]:
+    """
+    Count how many times each value appears in `items`.
+
+    Counter uses a hash map internally, giving O(n) time instead of O(n²).
+    All elements must be hashable.
+
+    Args:
+        items: An iterable of hashable elements.
+
+    Returns:
+        A dictionary mapping each unique element to its occurrence count.
+
+    Raises:
+        TypeError: If `items` contains unhashable elements.
+    """
+    try:
+        return dict(Counter(items))
+    except TypeError as exc:
+        raise TypeError("All elements in `items` must be hashable to be counted.") from exc
 ```
 
 #### 3. Eliminate N+1 database queries
@@ -73,9 +92,18 @@ def get_users_with_orders(session):
 
 After:
 ```python
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, Session
+from typing import List
 
-def get_users_with_orders(session):
+def get_users_with_orders(session: Session) -> List[User]:
+    """
+    Fetch all users and their associated orders in a single query.
+
+    Uses eager loading via `joinedload` to avoid the N+1 query problem
+    that occurs when accessing `user.orders` in a loop. For very large
+    collections, consider `selectinload(User.orders)` to avoid row
+    duplication from a JOIN.
+    """
     return (
         session.query(User)
         .options(joinedload(User.orders))
@@ -98,17 +126,69 @@ def fetch_data(key):
 
 After:
 ```python
+import copy
 import requests
 from functools import lru_cache
+from urllib.parse import urljoin, quote
+from typing import Any
 
 BASE = "https://api.example.com"
+MAX_CACHE_SIZE = 1024
 
-@lru_cache(maxsize=1024)
-def fetch_data(key):
-    return requests.get(f"{BASE}/{key}", timeout=5).json()
+# Reuse TCP connections across calls to reduce handshake overhead.
+_SESSION = requests.Session()
+
+
+def _sanitize_key(key: str) -> str:
+    """
+    Validate and URL-encode a path segment to prevent path traversal
+    or injection in the final request URL.
+
+    Args:
+        key: The API identifier to fetch.
+
+    Returns:
+        A cleaned, URL-safe path segment.
+
+    Raises:
+        TypeError: If `key` is not a string.
+        ValueError: If `key` is empty or contains only whitespace.
+    """
+    if not isinstance(key, str):
+        raise TypeError(f"Expected str key, got {type(key).__name__}")
+    key = key.strip().replace("\x00", "")
+    if not key:
+        raise ValueError("key must be a non-empty string")
+    return quote(key, safe="")
+
+
+@lru_cache(maxsize=MAX_CACHE_SIZE)
+def fetch_data(key: str) -> Any:
+    """
+    Fetch JSON data for `key`, caching up to MAX_CACHE_SIZE entries.
+
+    Args:
+        key: A non-empty API identifier.
+
+    Returns:
+        Parsed JSON response. A deep copy is returned so callers cannot
+        accidentally mutate the cached object.
+
+    Raises:
+        requests.RequestException: On network or HTTP error.
+        TypeError / ValueError: On invalid input.
+    """
+    safe_key = _sanitize_key(key)
+    url = urljoin(BASE + "/", safe_key)
+
+    response = _SESSION.get(url, timeout=5)
+    response.raise_for_status()
+
+    # Return a copy so mutations by one caller don't poison the cache.
+    return copy.deepcopy(response.json())
 ```
 
-> For cross-request caching in a web app, swap `lru_cache` for Redis/memcached.
+> For cross-request caching in a web app, swap `lru_cache` for Redis/memcached. Never cache user-specific or sensitive data in a process-wide cache unless it is intended to be shared.
 
 #### 5. Vectorize pandas/numpy operations
 File: `src/data_processing.py`
@@ -125,9 +205,24 @@ def compute_total(df):
 
 After:
 ```python
-def compute_total(df):
-    df["total"] = df["price"] * df["quantity"]
-    return df
+import pandas as pd
+
+def compute_total(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a `total` column computed as price * quantity.
+
+    Uses vectorized arithmetic instead of iterating rows, which is
+    orders of magnitude faster and avoids Python-level loop overhead.
+    """
+    required = {"price", "quantity"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Input DataFrame is missing required columns: {missing}")
+
+    # Work on a copy so callers are not surprised by side effects.
+    result = df.copy()
+    result["total"] = result["price"] * result["quantity"]
+    return result
 ```
 
 #### 6. Defer heavy imports until needed
@@ -140,9 +235,19 @@ import heavy_ml_library  # imported at startup even for CLI help
 
 After:
 ```python
+# Defer the heavy import until the model is actually required.
+# This keeps CLI help and startup paths fast.
+_model = None
+
 def load_model():
-    import heavy_ml_library
-    return heavy_ml_library.load("model.bin")
+    """
+    Lazily load the ML model and cache it for subsequent calls.
+    """
+    global _model
+    if _model is None:
+        import heavy_ml_library
+        _model = heavy_ml_library.load("model.bin")
+    return _model
 ```
 
 ---
